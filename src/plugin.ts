@@ -1,31 +1,16 @@
 import * as tslint from 'tslint';
 import * as ts_module from 'typescript/lib/tsserverlibrary';
-import { pluginId, TSLINT_ERROR_CODE, TSLINT_ERROR_SOURCE } from './config';
-import { ConfigFileWatcher } from './configFileWatcher';
-import { Logger } from './logger';
-import { RunResult, TsLintRunner } from './runner';
-import { Settings, loadSettingsFromTSConfig } from './settings';
 
-class FailureMap {
-    private readonly _map = new Map<string, tslint.RuleFailure>();
-
-    public get(start: number, end: number) {
-        return this._map.get(this.key(start, end));
-    }
-
-    public set(start: number, end: number, failure: tslint.RuleFailure): void {
-        this._map.set(this.key(start, end), failure);
-    }
-
-    public values() {
-        return this._map.values();
-    }
-
-    // key to identify a rule failure
-    private key(start: number, end: number): string {
-        return `[${start},${end}]`;
-    }
-}
+import { pluginId, TSLINT_ERROR_CODE, TSLINT_ERROR_SOURCE } from 'config';
+import { ConfigFileWatcher } from 'configFileWatcher';
+import { FailureMap } from 'failureMap';
+import { addDisableRuleFix } from 'fixes/addDisableRuleFix';
+import { addAllAutoFixable } from 'fixes/addAllAutoFixable';
+import { addRuleFailureFix } from 'fixes/addRuleFailureFix';
+import { addRuleFailureFixAll } from './fixes/addRuleFailureFixAll';
+import { Logger } from 'logger';
+import { RunResult, TsLintRunner } from 'runner';
+import { Settings, loadSettingsFromTSConfig } from 'settings';
 
 export class TSLintPlugin {
     private readonly codeFixActions = new Map<string, FailureMap>();
@@ -149,7 +134,7 @@ export class TSLintPlugin {
             return diagnostics;
         };
 
-        const getCodeFixesAtPosition = languageService.getCodeFixesAtPosition.bind(languageService);
+        const getCodeFixesAtPosition: typeof languageService.getCodeFixesAtPosition = languageService.getCodeFixesAtPosition.bind(languageService);
 
         languageService.getCodeFixesAtPosition = (fileName: string, start: number, end: number, errorCodes: number[], formatOptions: ts.FormatCodeSettings, userPreferences: ts.UserPreferences): ReadonlyArray<ts.CodeFixAction> => {
             const prior = getCodeFixesAtPosition(fileName, start, end, errorCodes, formatOptions, userPreferences);
@@ -165,12 +150,12 @@ export class TSLintPlugin {
 
                 const problem = documentFixes.get(start, end);
                 if (problem) {
-                    this.addRuleFailureFix(fixes, problem, fileName);
-                    this.addRuleFailureFixAll(fixes, problem.getRuleName(), documentFixes, fileName);
+                    addRuleFailureFix(fixes, problem, fileName);
+                    addRuleFailureFixAll(fixes, problem.getRuleName(), documentFixes, fileName);
                 }
-                this.addAllAutoFixable(fixes, documentFixes, fileName);
+                addAllAutoFixable(fixes, documentFixes, fileName, this.runner);
                 if (problem) {
-                    this.addDisableRuleFix(fixes, problem, fileName, this.getProgram().getSourceFile(fileName)!);
+                    addDisableRuleFix(fixes, problem, fileName, this.getProgram().getSourceFile(fileName)!);
                 }
 
                 return fixes;
@@ -200,60 +185,6 @@ export class TSLintPlugin {
             this.codeFixActions.set(file.fileName, documentAutoFixes);
         }
         documentAutoFixes.set(problem.getStartPosition().getPosition(), problem.getEndPosition().getPosition(), problem);
-    }
-
-    private addRuleFailureFix(fixes: ts_module.CodeAction[], problem: tslint.RuleFailure, fileName: string) {
-        fixes.push({
-            description: `Fix '${problem.getRuleName()}'`,
-            changes: [problemToFileTextChange(problem, fileName)],
-        });
-    }
-
-    /**
-     * Generate a code action that fixes all instances of ruleName.
-     */
-    private addRuleFailureFixAll(fixes: ts_module.CodeAction[], ruleName: string, problems: FailureMap, fileName: string) {
-        const changes: ts_module.FileTextChanges[] = [];
-
-        for (const problem of problems.values()) {
-            if (problem.getRuleName() === ruleName) {
-                changes.push(problemToFileTextChange(problem, fileName));
-            }
-        }
-
-        /* No need for this action if there's only one instance.  */
-        if (changes.length < 2) {
-            return;
-        }
-
-        fixes.push({
-            description: `Fix all '${ruleName}'`,
-            changes,
-        });
-    }
-
-    private addDisableRuleFix(fixes: ts_module.CodeAction[], problem: tslint.RuleFailure, fileName: string, file: ts_module.SourceFile) {
-        fixes.push({
-            description: `Disable rule '${problem.getRuleName()}'`,
-            changes: [{
-                fileName,
-                textChanges: [{
-                    newText: `// tslint:disable-next-line:${problem.getRuleName()}\n`,
-                    span: { start: file.getLineStarts()[problem.getStartPosition().getLineAndCharacter().line], length: 0 },
-                }],
-            }],
-        });
-    }
-
-    private addAllAutoFixable(fixes: ts_module.CodeAction[], documentFixes: FailureMap, fileName: string) {
-        const allReplacements = this.runner.getNonOverlappingReplacements(Array.from(documentFixes.values()));
-        fixes.push({
-            description: `Fix all auto-fixable tslint failures`,
-            changes: [{
-                fileName,
-                textChanges: allReplacements.map(convertReplacementToTextChange),
-            }],
-        });
     }
 
     private getProgram() {
@@ -287,40 +218,6 @@ export class TSLintPlugin {
         }
         return this.ts.DiagnosticCategory.Warning;
     }
-}
-
-function getReplacements(fix: tslint.Fix | undefined): tslint.Replacement[] {
-    let replacements: tslint.Replacement[] | null = null;
-    // in tslint4 a Fix has a replacement property with the Replacements
-    if ((fix as any).replacements) {
-        // tslint4
-        replacements = (fix as any).replacements;
-    } else {
-        // in tslint 5 a Fix is a Replacement | Replacement[]
-        if (!Array.isArray(fix)) {
-            replacements = [fix as any];
-        } else {
-            replacements = fix;
-        }
-    }
-    return replacements || [];
-}
-
-function convertReplacementToTextChange(repl: tslint.Replacement): ts_module.TextChange {
-    return {
-        newText: repl.text,
-        span: { start: repl.start, length: repl.length },
-    };
-}
-
-function problemToFileTextChange(problem: tslint.RuleFailure, fileName: string): ts_module.FileTextChanges {
-    const fix = problem.getFix();
-    const replacements: tslint.Replacement[] = getReplacements(fix);
-
-    return {
-        fileName,
-        textChanges: replacements.map(convertReplacementToTextChange),
-    };
 }
 
 function replacementsAreEmpty(fix: tslint.Fix | undefined): boolean {
